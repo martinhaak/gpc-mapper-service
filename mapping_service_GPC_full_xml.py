@@ -6,6 +6,7 @@ import numpy as np
 import hashlib, json, os, threading, time, re
 from typing import Dict, Optional, List
 import xml.etree.ElementTree as ET
+from functools import wraps
 
 # -----------------------
 # Konfiguration
@@ -17,6 +18,46 @@ BATCH_SIZE = 64
 ENCODING   = 'utf-8'
 EMB_DIR    = os.getenv('GPC_EMB_DIR', '.')  # pro Modell/Instanz separater Speicherpfad empfohlen
 PORT       = int(os.getenv('GPC_PORT', '5002'))
+API_KEY    = os.getenv('GPC_API_KEY')  # Wenn gesetzt, wird API-Key für alle Endpunkte erzwungen
+
+# -----------------------
+# API-Key Schutz
+# -----------------------
+def _provided_api_key() -> Optional[str]:
+    # 1) Query Param
+    key = request.args.get('api_key')
+    if key:
+        return key
+    # 2) Header
+    key = request.headers.get('X-API-Key')
+    if key:
+        return key
+    # 3) JSON Body (POST/PUT/PATCH)
+    if request.method in ('POST', 'PUT', 'PATCH'):
+        data = request.get_json(silent=True) or {}
+        key = data.get('api_key')
+        if key:
+            return key
+    # 4) Form
+    try:
+        key = request.form.get('api_key')  # type: ignore[attr-defined]
+        if key:
+            return key
+    except Exception:
+        pass
+    return None
+
+def require_api_key(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if API_KEY:
+            provided = _provided_api_key()
+            if not provided:
+                return jsonify({"error": "API key required"}), 401
+            if provided != API_KEY:
+                return jsonify({"error": "Invalid API key"}), 403
+        return func(*args, **kwargs)
+    return wrapper
 
 # Erwartete Spalten / Hierarchie
 COLS = {
@@ -716,6 +757,7 @@ def match_on_level(query: str, level: str, parent_filters: Optional[dict] = None
 # Routes
 # -----------------------
 @app.route('/status', methods=['GET'])
+@require_api_key
 def status():
     with lock:
         statuses = {}
@@ -742,6 +784,7 @@ def status():
         })
 
 @app.route('/rebuild', methods=['POST'])
+@require_api_key
 def rebuild():
     data = request.get_json(silent=True) or {}
     level = (data.get("level") or "all").lower()
@@ -759,6 +802,7 @@ def rebuild():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/match', methods=['POST'])
+@require_api_key
 def match():
     data = request.get_json(silent=True) or {}
     query = data.get("query", "")
