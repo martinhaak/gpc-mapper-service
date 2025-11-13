@@ -3,4 +3,5 @@ __pycache__/
 .DS_Store
 emb/
 data/*.xml
+!data/GPC as of May 2025 v20250509 DE.xml
 *.npz
