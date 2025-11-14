@@ -42,6 +42,9 @@ export GPC_MODEL_NAME=all-MiniLM-L6-v2
 export GPC_EMB_DIR=emb/all-MiniLM-L6-v2
 export GPC_PORT=5002
 export GPC_API_KEY=change_me_secret_key
+export GPC_BATCH_SIZE=16           # kleinere Batches für wenig RAM/CPU
+export GPC_ATTR_LAZY=1             # Attribute on-the-fly (empfohlen bei wenig RAM)
+export GPC_ATTR_MAX_ROWS=40000     # Sicherheitslimit für Attribute-Kandidaten
 gunicorn -w 1 -b 0.0.0.0:${GPC_PORT} "mapping_service_GPC_full_xml:app"
 ```
 
@@ -58,6 +61,9 @@ Environment=GPC_MODEL_NAME=all-MiniLM-L6-v2
 Environment=GPC_EMB_DIR=/home/%i/gpc-mapping-service/emb/all-MiniLM-L6-v2
 Environment=GPC_PORT=5002
 Environment=GPC_API_KEY=change_me_secret_key
+Environment=GPC_BATCH_SIZE=16
+Environment=GPC_ATTR_LAZY=1
+Environment=GPC_ATTR_MAX_ROWS=40000
 ExecStart=/home/%i/gpc-mapping-service/venv/bin/gunicorn -w 1 -b 0.0.0.0:${GPC_PORT} mapping_service_GPC_full_xml:app
 Restart=on-failure
 

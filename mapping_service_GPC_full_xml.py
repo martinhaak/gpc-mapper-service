@@ -14,11 +14,13 @@ from functools import wraps
 XML_PATH   = 'data/GPC as of May 2025 v20250509 DE.xml'
 # Konfigurierbar über ENV: GPC_MODEL_NAME, GPC_EMB_DIR, GPC_PORT
 MODEL_NAME = os.getenv('GPC_MODEL_NAME', 'all-MiniLM-L6-v2')
-BATCH_SIZE = 64
+BATCH_SIZE = int(os.getenv('GPC_BATCH_SIZE', '16'))
 ENCODING   = 'utf-8'
 EMB_DIR    = os.getenv('GPC_EMB_DIR', '.')  # pro Modell/Instanz separater Speicherpfad empfohlen
 PORT       = int(os.getenv('GPC_PORT', '5002'))
 API_KEY    = os.getenv('GPC_API_KEY')  # Wenn gesetzt, wird API-Key für alle Endpunkte erzwungen
+ATTR_LAZY  = os.getenv('GPC_ATTR_LAZY', '1') == '1'  # Lazy-Attributmodus: Embeddings on-the-fly, gefiltert
+ATTR_MAX_ROWS = int(os.getenv('GPC_ATTR_MAX_ROWS', '40000'))  # Sicherheitslimit für Kandidaten (Lazy)
 
 # -----------------------
 # API-Key Schutz
@@ -579,71 +581,78 @@ def match_on_level(query: str, level: str, parent_filters: Optional[dict] = None
 
     # Optional: Attributsuche nur für Brick-Ebene (kombiniertes Scoring)
     if level == 'brick' and search_attributes:
-        ensure_attributes_loaded()
-        attr_rows = ATTR["rows"]
-        attr_emb = ATTR_EMB["emb"]
-
         use_type = bool(search_attribute_type)
         use_value = bool(search_attribute_value)
         use_combined = not (use_type or use_value)  # Standard: bisheriges Verhalten
 
-        # Parent-Filter anwenden (auf BrickCode via df rows join)
-        if parent_filters:
-            mask = pd.Series([True] * len(attr_rows))
-            for pcol, pval in parent_filters.items():
-                if pcol in attr_rows.columns and pval is not None:
-                    mask &= (attr_rows[pcol].astype(str) == str(pval))
-            attr_candidates = attr_rows[mask].reset_index(drop=True)
-            cand_indices = np.flatnonzero(mask.values)
-            if len(attr_candidates) == 0:
-                attr_candidates = None
-        else:
-            attr_candidates = attr_rows
-            cand_indices = None
-
-        # Map für besten Attribut-Score je Brick aufbauen (kombiniert aus gewählten Modi)
-        best_attr_by_brick: Dict[str, Dict[str, object]] = {}
-
-        # Combined-Modus
-        if use_combined and attr_candidates is not None and len(attr_candidates) > 0:
-            if cand_indices is not None:
-                attr_emb_subset = attr_emb[cand_indices]
-            else:
-                attr_emb_subset = attr_emb
-            sims_attr_raw = cosine_similarity(q, attr_emb_subset)[0]
-            tmp = attr_candidates.assign(_sim=pd.Series(sims_attr_raw, index=attr_candidates.index))
-            grouped = tmp.sort_values('_sim', ascending=False).groupby('BrickCode', as_index=False).first()
-            for _, r in grouped.iterrows():
-                bcode = str(r.get('BrickCode')) if pd.notna(r.get('BrickCode')) else None
-                if not bcode:
-                    continue
-                best_attr_by_brick[bcode] = {
-                    'attr_sim': float(r['_sim']),
-                    'type_code': r.get('AttTypeCode'),
-                    'type_text': r.get('AttTypeText'),
-                    'value_code': r.get('AttValueCode'),
-                    'value_text': r.get('AttValueText'),
-                }
-
-        # Type-only Modus
-        if use_type:
-            ensure_attribute_types_loaded()
-            type_rows = ATTR_TYPE["rows"]
-            type_emb = ATTR_TYPE_EMB["emb"]
+        # Lazy-Modus: Embeddings nur für (gefilterte) Teilmenge on-the-fly berechnen
+        if ATTR_LAZY:
+            # Basisdaten
+            base_rows = df_attr.dropna(subset=['BrickCode']).copy()
+            # Parent-Filter anwenden
             if parent_filters:
-                mask = pd.Series([True] * len(type_rows))
+                mask = pd.Series([True] * len(base_rows))
                 for pcol, pval in parent_filters.items():
-                    if pcol in type_rows.columns and pval is not None:
-                        mask &= (type_rows[pcol].astype(str) == str(pval))
-                type_candidates = type_rows[mask].reset_index(drop=True)
-                type_idx = np.flatnonzero(mask.values)
-            else:
-                type_candidates = type_rows
-                type_idx = None
-            if type_candidates is not None and len(type_candidates) > 0:
-                type_emb_subset = type_emb[type_idx] if type_idx is not None else type_emb
+                    if pcol in base_rows.columns and pval is not None:
+                        mask &= (base_rows[pcol].astype(str) == str(pval))
+                base_rows = base_rows[mask].reset_index(drop=True)
+            # Combined: _AttrText erzeugen
+            combined_rows = None
+            if use_combined:
+                combined_texts = []
+                for _, r in base_rows.iterrows():
+                    if pd.notna(r.get('AttValueText')):
+                        combined_texts.append(f\"{r.get('AttTypeText','')} {r.get('AttValueText','')}\".strip())
+                    else:
+                        combined_texts.append(f\"{r.get('AttTypeText','')}\".strip())
+                combined_rows = base_rows.assign(_AttrText=pd.Series(combined_texts, index=base_rows.index))
+                if len(combined_rows) > ATTR_MAX_ROWS:
+                    combined_rows = combined_rows.head(ATTR_MAX_ROWS).reset_index(drop=True)
+
+            # Typ-only
+            type_rows = None
+            if use_type:
+                type_rows = base_rows.dropna(subset=['AttTypeText']).copy()
+                type_rows = type_rows.assign(_TypeText=type_rows['AttTypeText'].astype(str))
+                if len(type_rows) > ATTR_MAX_ROWS:
+                    type_rows = type_rows.head(ATTR_MAX_ROWS).reset_index(drop=True)
+
+            # Value-only
+            value_rows = None
+            if use_value:
+                value_rows = base_rows.dropna(subset=['AttValueText']).copy()
+                value_rows = value_rows.assign(_ValueText=value_rows['AttValueText'].astype(str))
+                if len(value_rows) > ATTR_MAX_ROWS:
+                    value_rows = value_rows.head(ATTR_MAX_ROWS).reset_index(drop=True)
+
+            best_attr_by_brick: Dict[str, Dict[str, object]] = {}
+
+            # Query-Embedding
+            q = model.encode([query], convert_to_numpy=True)
+
+            # Combined
+            if use_combined and combined_rows is not None and len(combined_rows) > 0:
+                emb_subset = build_embeddings(model, combined_rows['_AttrText'].tolist())
+                sims_attr_raw = cosine_similarity(q, emb_subset)[0]
+                tmp = combined_rows.assign(_sim=pd.Series(sims_attr_raw, index=combined_rows.index))
+                grouped = tmp.sort_values('_sim', ascending=False).groupby('BrickCode', as_index=False).first()
+                for _, r in grouped.iterrows():
+                    bcode = str(r.get('BrickCode')) if pd.notna(r.get('BrickCode')) else None
+                    if not bcode:
+                        continue
+                    best_attr_by_brick[bcode] = {
+                        'attr_sim': float(r['_sim']),
+                        'type_code': r.get('AttTypeCode'),
+                        'type_text': r.get('AttTypeText'),
+                        'value_code': r.get('AttValueCode'),
+                        'value_text': r.get('AttValueText'),
+                    }
+
+            # Type-only
+            if use_type and type_rows is not None and len(type_rows) > 0:
+                type_emb_subset = build_embeddings(model, type_rows['_TypeText'].tolist())
                 sims_type = cosine_similarity(q, type_emb_subset)[0]
-                tmp = type_candidates.assign(_sim=pd.Series(sims_type, index=type_candidates.index))
+                tmp = type_rows.assign(_sim=pd.Series(sims_type, index=type_rows.index))
                 grouped = tmp.sort_values('_sim', ascending=False).groupby('BrickCode', as_index=False).first()
                 for _, r in grouped.iterrows():
                     bcode = str(r.get('BrickCode')) if pd.notna(r.get('BrickCode')) else None
@@ -659,25 +668,11 @@ def match_on_level(query: str, level: str, parent_filters: Optional[dict] = None
                     entry['type_text'] = r.get('AttTypeText')
                     best_attr_by_brick[bcode] = entry
 
-        # Value-only Modus
-        if use_value:
-            ensure_attribute_values_loaded()
-            value_rows = ATTR_VALUE["rows"]
-            value_emb = ATTR_VALUE_EMB["emb"]
-            if parent_filters:
-                mask = pd.Series([True] * len(value_rows))
-                for pcol, pval in parent_filters.items():
-                    if pcol in value_rows.columns and pval is not None:
-                        mask &= (value_rows[pcol].astype(str) == str(pval))
-                value_candidates = value_rows[mask].reset_index(drop=True)
-                value_idx = np.flatnonzero(mask.values)
-            else:
-                value_candidates = value_rows
-                value_idx = None
-            if value_candidates is not None and len(value_candidates) > 0:
-                value_emb_subset = value_emb[value_idx] if value_idx is not None else value_emb
+            # Value-only
+            if use_value and value_rows is not None and len(value_rows) > 0:
+                value_emb_subset = build_embeddings(model, value_rows['_ValueText'].tolist())
                 sims_val = cosine_similarity(q, value_emb_subset)[0]
-                tmp = value_candidates.assign(_sim=pd.Series(sims_val, index=value_candidates.index))
+                tmp = value_rows.assign(_sim=pd.Series(sims_val, index=value_rows.index))
                 grouped = tmp.sort_values('_sim', ascending=False).groupby('BrickCode', as_index=False).first()
                 for _, r in grouped.iterrows():
                     bcode = str(r.get('BrickCode')) if pd.notna(r.get('BrickCode')) else None
@@ -692,6 +687,116 @@ def match_on_level(query: str, level: str, parent_filters: Optional[dict] = None
                     entry['value_code'] = r.get('AttValueCode')
                     entry['value_text'] = r.get('AttValueText')
                     best_attr_by_brick[bcode] = entry
+        else:
+            # Persistenter Modus: vorab geladene Embeddings nutzen
+            ensure_attributes_loaded()
+            attr_rows = ATTR["rows"]
+            attr_emb = ATTR_EMB["emb"]
+
+            # Parent-Filter anwenden (auf BrickCode via df rows join)
+            if parent_filters:
+                mask = pd.Series([True] * len(attr_rows))
+                for pcol, pval in parent_filters.items():
+                    if pcol in attr_rows.columns and pval is not None:
+                        mask &= (attr_rows[pcol].astype(str) == str(pval))
+                attr_candidates = attr_rows[mask].reset_index(drop=True)
+                cand_indices = np.flatnonzero(mask.values)
+                if len(attr_candidates) == 0:
+                    attr_candidates = None
+            else:
+                attr_candidates = attr_rows
+                cand_indices = None
+
+            best_attr_by_brick: Dict[str, Dict[str, object]] = {}
+
+            # Combined-Modus
+            if use_combined and attr_candidates is not None and len(attr_candidates) > 0:
+                if cand_indices is not None:
+                    attr_emb_subset = attr_emb[cand_indices]
+                else:
+                    attr_emb_subset = attr_emb
+                sims_attr_raw = cosine_similarity(q, attr_emb_subset)[0]
+                tmp = attr_candidates.assign(_sim=pd.Series(sims_attr_raw, index=attr_candidates.index))
+                grouped = tmp.sort_values('_sim', ascending=False).groupby('BrickCode', as_index=False).first()
+                for _, r in grouped.iterrows():
+                    bcode = str(r.get('BrickCode')) if pd.notna(r.get('BrickCode')) else None
+                    if not bcode:
+                        continue
+                    best_attr_by_brick[bcode] = {
+                        'attr_sim': float(r['_sim']),
+                        'type_code': r.get('AttTypeCode'),
+                        'type_text': r.get('AttTypeText'),
+                        'value_code': r.get('AttValueCode'),
+                        'value_text': r.get('AttValueText'),
+                    }
+
+            # Type-only Modus
+            if use_type:
+                ensure_attribute_types_loaded()
+                type_rows = ATTR_TYPE["rows"]
+                type_emb = ATTR_TYPE_EMB["emb"]
+                if parent_filters:
+                    mask = pd.Series([True] * len(type_rows))
+                    for pcol, pval in parent_filters.items():
+                        if pcol in type_rows.columns and pval is not None:
+                            mask &= (type_rows[pcol].astype(str) == str(pval))
+                    type_candidates = type_rows[mask].reset_index(drop=True)
+                    type_idx = np.flatnonzero(mask.values)
+                else:
+                    type_candidates = type_rows
+                    type_idx = None
+                if type_candidates is not None and len(type_candidates) > 0:
+                    type_emb_subset = type_emb[type_idx] if type_idx is not None else type_emb
+                    sims_type = cosine_similarity(q, type_emb_subset)[0]
+                    tmp = type_candidates.assign(_sim=pd.Series(sims_type, index=type_candidates.index))
+                    grouped = tmp.sort_values('_sim', ascending=False).groupby('BrickCode', as_index=False).first()
+                    for _, r in grouped.iterrows():
+                        bcode = str(r.get('BrickCode')) if pd.notna(r.get('BrickCode')) else None
+                        if not bcode:
+                            continue
+                        entry = best_attr_by_brick.get(bcode, {
+                            'attr_sim': 0.0,
+                            'type_code': None, 'type_text': None,
+                            'value_code': None, 'value_text': None,
+                        })
+                        entry['attr_sim'] = float(entry['attr_sim']) + float(r['_sim'])
+                        entry['type_code'] = r.get('AttTypeCode')
+                        entry['type_text'] = r.get('AttTypeText')
+                        best_attr_by_brick[bcode] = entry
+
+            # Value-only Modus
+            if use_value:
+                ensure_attribute_values_loaded()
+                value_rows = ATTR_VALUE["rows"]
+                value_emb = ATTR_VALUE_EMB["emb"]
+                if parent_filters:
+                    mask = pd.Series([True] * len(value_rows))
+                    for pcol, pval in parent_filters.items():
+                        if pcol in value_rows.columns and pval is not None:
+                            mask &= (value_rows[pcol].astype(str) == str(pval))
+                    value_candidates = value_rows[mask].reset_index(drop=True)
+                    value_idx = np.flatnonzero(mask.values)
+                else:
+                    value_candidates = value_rows
+                    value_idx = None
+                if value_candidates is not None and len(value_candidates) > 0:
+                    value_emb_subset = value_emb[value_idx] if value_idx is not None else value_emb
+                    sims_val = cosine_similarity(q, value_emb_subset)[0]
+                    tmp = value_candidates.assign(_sim=pd.Series(sims_val, index=value_candidates.index))
+                    grouped = tmp.sort_values('_sim', ascending=False).groupby('BrickCode', as_index=False).first()
+                    for _, r in grouped.iterrows():
+                        bcode = str(r.get('BrickCode')) if pd.notna(r.get('BrickCode')) else None
+                        if not bcode:
+                            continue
+                        entry = best_attr_by_brick.get(bcode, {
+                            'attr_sim': 0.0,
+                            'type_code': None, 'type_text': None,
+                            'value_code': None, 'value_text': None,
+                        })
+                        entry['attr_sim'] = float(entry['attr_sim']) + float(r['_sim'])
+                        entry['value_code'] = r.get('AttValueCode')
+                        entry['value_text'] = r.get('AttValueText')
+                        best_attr_by_brick[bcode] = entry
 
         # Kombiniere Titel-Score mit Attribut-Score: title + attribute_weight * attr
         weight = float(attribute_weight)
@@ -824,26 +929,47 @@ def match():
     # Spezial-Level: nur Attribut-Werte suchen, Brick-Code/Path zurückgeben
     if level in ("attr_value", "attribute_value"):
         try:
-            ensure_attribute_values_loaded()
-            value_rows = ATTR_VALUE["rows"]
-            value_emb = ATTR_VALUE_EMB["emb"]
+            if ATTR_LAZY:
+                value_rows = df_attr.dropna(subset=['BrickCode', 'AttValueText']).copy()
+                # Parent-Filter anwenden
+                if parent_filters:
+                    mask = pd.Series([True] * len(value_rows))
+                    for pcol, pval in parent_filters.items():
+                        if pcol in value_rows.columns and pval is not None:
+                            mask &= (value_rows[pcol].astype(str) == str(pval))
+                    value_rows = value_rows[mask].reset_index(drop=True)
+                value_rows = value_rows.assign(_ValueText=value_rows['AttValueText'].astype(str))
+                if len(value_rows) == 0:
+                    return jsonify({"query": query, "level": "brick", "matches": []})
+                if len(value_rows) > ATTR_MAX_ROWS:
+                    value_rows = value_rows.head(ATTR_MAX_ROWS).reset_index(drop=True)
+                q = model.encode([query], convert_to_numpy=True)
+                value_emb = build_embeddings(model, value_rows['_ValueText'].tolist())
+                emb_subset = value_emb
+                candidates = value_rows
+            else:
+                ensure_attribute_values_loaded()
+                value_rows = ATTR_VALUE["rows"]
+                value_emb = ATTR_VALUE_EMB["emb"]
 
             # Parent-Filter anwenden
-            if parent_filters:
-                mask = pd.Series([True] * len(value_rows))
-                for pcol, pval in parent_filters.items():
-                    if pcol in value_rows.columns and pval is not None:
-                        mask &= (value_rows[pcol].astype(str) == str(pval))
-                candidates = value_rows[mask].reset_index(drop=True)
-                cand_idx = np.flatnonzero(mask.values)
-                if len(candidates) == 0:
-                    return jsonify({"query": query, "level": "brick", "matches": []})
-                emb_subset = value_emb[cand_idx]
-            else:
-                candidates = value_rows
-                emb_subset = value_emb
+            if not ATTR_LAZY:
+                if parent_filters:
+                    mask = pd.Series([True] * len(value_rows))
+                    for pcol, pval in parent_filters.items():
+                        if pcol in value_rows.columns and pval is not None:
+                            mask &= (value_rows[pcol].astype(str) == str(pval))
+                    candidates = value_rows[mask].reset_index(drop=True)
+                    cand_idx = np.flatnonzero(mask.values)
+                    if len(candidates) == 0:
+                        return jsonify({"query": query, "level": "brick", "matches": []})
+                    emb_subset = value_emb[cand_idx]
+                else:
+                    candidates = value_rows
+                    emb_subset = value_emb
 
-            q = model.encode([query], convert_to_numpy=True)
+            if not ATTR_LAZY:
+                q = model.encode([query], convert_to_numpy=True)
             sims = cosine_similarity(q, emb_subset)[0]
             tmp = candidates.assign(_sim=pd.Series(sims, index=candidates.index))
             # Bester Value-Treffer je Brick (danach erneut nach Score sortieren)
