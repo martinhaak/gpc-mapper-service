@@ -279,7 +279,8 @@ def try_load_embeddings(path: str) -> Optional[Dict]:
         return None
     try:
         npz = np.load(path, allow_pickle=True)
-        if 'embeddings' not in npz.files or 'codes' not in npz.files or 'titles' not in npz.files:
+        # Für Attribut-NPZs existiert kein 'codes'-Array; daher nur 'embeddings' und 'titles' erzwingen
+        if 'embeddings' not in npz.files or 'titles' not in npz.files:
             return None
         def _scalar(x):
             try:
@@ -292,7 +293,7 @@ def try_load_embeddings(path: str) -> Optional[Dict]:
             except Exception:
                 return x
         embeddings = npz['embeddings']
-        codes = npz['codes']
+        codes = npz['codes'] if 'codes' in npz.files else np.asarray([], dtype='U')
         titles = npz['titles']
         if getattr(titles, "dtype", None) is object:
             titles = np.asarray(titles.astype(str), dtype='U')
