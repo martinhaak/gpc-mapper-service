@@ -261,11 +261,13 @@ def save_embeddings(path: str, embeddings: np.ndarray, rows: pd.DataFrame, model
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
+    codes_arr = np.asarray(rows[key_code].astype(str).values, dtype='U')
+    titles_arr = np.asarray(rows[key_title].astype(str).values, dtype='U')
     np.savez_compressed(
         path,
         embeddings=embeddings.astype(np.float32),
-        codes=rows[key_code].astype(str).values,
-        titles=rows[key_title].astype(str).values,
+        codes=codes_arr,
+        titles=titles_arr,
         level=level,
         model_name=model_name,
         fingerprint=fingerprint,
@@ -276,16 +278,62 @@ def try_load_embeddings(path: str) -> Optional[Dict]:
     if not os.path.exists(path):
         return None
     try:
-        data = np.load(path, allow_pickle=False)
+        npz = np.load(path, allow_pickle=True)
+        if 'embeddings' not in npz.files or 'codes' not in npz.files or 'titles' not in npz.files:
+            return None
+        def _scalar(x):
+            try:
+                if isinstance(x, np.ndarray):
+                    if x.shape == ():
+                        return x.item()
+                    if x.size == 1:
+                        return x.reshape(()).item()
+                return x
+            except Exception:
+                return x
+        embeddings = npz['embeddings']
+        codes = npz['codes']
+        titles = npz['titles']
+        if getattr(titles, "dtype", None) is object:
+            titles = np.asarray(titles.astype(str), dtype='U')
+        if getattr(codes, "dtype", None) is object:
+            codes = np.asarray(codes.astype(str), dtype='U')
+        level = str(_scalar(npz['level'])) if 'level' in npz.files else ''
+        model_name = str(_scalar(npz['model_name'])) if 'model_name' in npz.files else ''
+        fingerprint = str(_scalar(npz['fingerprint'])) if 'fingerprint' in npz.files else ''
+        created_at_raw = npz['created_at'] if 'created_at' in npz.files else None
+        try:
+            created_at = int(_scalar(created_at_raw)) if created_at_raw is not None else 0
+        except Exception:
+            created_at = 0
         return {
-            "embeddings": data['embeddings'],
-            "codes": data['codes'],
-            "titles": data['titles'],
-            "level": str(data['level']),
-            "model_name": str(data['model_name']),
-            "fingerprint": str(data['fingerprint']),
-            "created_at": int(data['created_at'])
+            "embeddings": embeddings,
+            "codes": codes,
+            "titles": titles,
+            "level": level,
+            "model_name": model_name,
+            "fingerprint": fingerprint,
+            "created_at": created_at
         }
+    except Exception:
+        return None
+
+def try_load_embeddings_loose(path: str) -> Optional[Dict]:
+    """Sehr tolerantes Laden: lädt nur embeddings/codes/titles (allow_pickle=True), ohne weitere Validierung."""
+    if not os.path.exists(path):
+        return None
+    try:
+        npz = np.load(path, allow_pickle=True)
+        if 'embeddings' not in npz.files or 'codes' not in npz.files or 'titles' not in npz.files:
+            return None
+        embeddings = npz['embeddings']
+        codes = npz['codes']
+        titles = npz['titles']
+        if getattr(titles, "dtype", None) is object:
+            titles = np.asarray(titles.astype(str), dtype='U')
+        if getattr(codes, "dtype", None) is object:
+            codes = np.asarray(codes.astype(str), dtype='U')
+        return {"embeddings": embeddings, "codes": codes, "titles": titles}
     except Exception:
         return None
 
@@ -395,7 +443,7 @@ def ensure_attributes_loaded(force: bool = False):
         np.savez_compressed(
             attr_emb_path(),
             embeddings=emb.astype(np.float32),
-            titles=rows['_AttrText'].astype(str).values,
+            titles=np.asarray(rows['_AttrText'].astype(str).values, dtype='U'),
             model_name=MODEL_NAME,
             fingerprint=fp,
             created_at=int(time.time())
@@ -435,7 +483,7 @@ def ensure_attribute_types_loaded(force: bool = False):
         np.savez_compressed(
             attr_type_emb_path(),
             embeddings=emb.astype(np.float32),
-            titles=rows['_TypeText'].astype(str).values,
+            titles=np.asarray(rows['_TypeText'].astype(str).values, dtype='U'),
             model_name=MODEL_NAME,
             fingerprint=fp,
             created_at=int(time.time())
@@ -475,7 +523,7 @@ def ensure_attribute_values_loaded(force: bool = False):
         np.savez_compressed(
             attr_value_emb_path(),
             embeddings=emb.astype(np.float32),
-            titles=rows['_ValueText'].astype(str).values,
+            titles=np.asarray(rows['_ValueText'].astype(str).values, dtype='U'),
             model_name=MODEL_NAME,
             fingerprint=fp,
             created_at=int(time.time())
@@ -494,12 +542,28 @@ def ensure_level_loaded(level: str, parent_filters: Optional[dict] = None, force
             return
 
         meta = try_load_embeddings(emb_path(level))
-        if (not force) and meta is not None and meta["model_name"] == MODEL_NAME and meta["level"] == level:
-            if meta["fingerprint"] == fp and len(meta["titles"]) == len(rows):
+        if (not force) and meta is not None and meta.get("model_name") == MODEL_NAME and meta.get("level") == level:
+            if meta.get("fingerprint") == fp and len(meta.get("titles", [])) == len(rows):
                 MEM[level] = {
                     "rows": rows,
                     "emb": meta["embeddings"],
                     "fp": fp
+                }
+                return
+        # Fallback: sehr tolerantes Laden, falls strenger Loader scheitert
+        if (not force):
+            loose = try_load_embeddings_loose(emb_path(level))
+            if loose is not None and len(loose["titles"]) > 0:
+                code_col = COLS[level]["code"]
+                title_col = COLS[level]["title"]
+                loose_rows = pd.DataFrame({
+                    code_col: np.asarray(loose["codes"]).astype(str),
+                    title_col: np.asarray(loose["titles"]).astype(str),
+                })
+                MEM[level] = {
+                    "rows": loose_rows,
+                    "emb": loose["embeddings"],
+                    "fp": None
                 }
                 return
 
