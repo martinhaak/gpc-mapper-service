@@ -602,9 +602,9 @@ def match_on_level(query: str, level: str, parent_filters: Optional[dict] = None
                 combined_texts = []
                 for _, r in base_rows.iterrows():
                     if pd.notna(r.get('AttValueText')):
-                        combined_texts.append(f\"{r.get('AttTypeText','')} {r.get('AttValueText','')}\".strip())
+                        combined_texts.append(f"{r.get('AttTypeText','')} {r.get('AttValueText','')}".strip())
                     else:
-                        combined_texts.append(f\"{r.get('AttTypeText','')}\".strip())
+                        combined_texts.append(f"{r.get('AttTypeText','')}".strip())
                 combined_rows = base_rows.assign(_AttrText=pd.Series(combined_texts, index=base_rows.index))
                 if len(combined_rows) > ATTR_MAX_ROWS:
                     combined_rows = combined_rows.head(ATTR_MAX_ROWS).reset_index(drop=True)
