@@ -22,6 +22,13 @@ API_KEY    = os.getenv('GPC_API_KEY')  # Wenn gesetzt, wird API-Key für alle En
 ATTR_LAZY  = os.getenv('GPC_ATTR_LAZY', '1') == '1'  # Lazy-Attributmodus: Embeddings on-the-fly, gefiltert
 ATTR_MAX_ROWS = int(os.getenv('GPC_ATTR_MAX_ROWS', '40000'))  # Sicherheitslimit für Kandidaten (Lazy)
 
+# Basispfade relativ zum Skriptverzeichnis auflösen, wenn nicht absolut
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if not os.path.isabs(EMB_DIR):
+    EMB_DIR = os.path.join(_SCRIPT_DIR, EMB_DIR)
+if not os.path.isabs(XML_PATH):
+    XML_PATH = os.path.join(_SCRIPT_DIR, XML_PATH)
+
 # -----------------------
 # API-Key Schutz
 # -----------------------
